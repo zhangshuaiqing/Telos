@@ -468,18 +468,36 @@ telos/
 │   │   └── primitives.py     # 7 种原语实现
 │   ├── memory/
 │   │   └── memory.py         # 感觉缓冲 / 工作记忆 / 情景记忆 / 程序记忆
+│   ├── task/
+│   │   └── task_manager.py   # 任务分解 / DAG 调度 / 子任务生命周期
 │   ├── safety/
-│   │   └── safety.py         # 三层安全校验
+│   │   └── safety.py         # 三层安全校验 + 降级管理
+│   ├── spatial/
+│   │   ├── costmap.py        # 局部代价地图 (实时避障)
+│   │   └── topology.py       # 拓扑 + 语义地图 (全局导航)
+│   ├── power/
+│   │   └── power_manager.py  # 电源管理 / 太阳能充电 / 电量策略
+│   ├── interaction/
+│   │   ├── approval.py       # 审批机制 (危险动作确认)
+│   │   └── explain.py        # 行为解释 (可解释AI)
+│   ├── integration/
+│   │   └── home_assistant.py # 外部系统集成
 │   ├── comm/
 │   │   └── stm32.py          # STM32 二进制通信协议
+│   ├── observability/
+│   │   ├── logger.py         # 分层日志系统
+│   │   └── metrics.py        # 关键指标采集
 │   └── utils/
 │       └── config.py         # 配置管理
+├── sim/
+│   └── environment.py        # 仿真环境统一接口
 ├── docs/
-│   ├── architecture.md       # 本文档 (总体架构)
-│   ├── actuators.md          # 7 原语详细规格
+│   ├── architecture.md       # 本文档 (总体架构 — 20 章)
+│   ├── actuators.md          # 7 原语详细规格 (+ 扩展机制)
 │   ├── perception.md         # 感知通道详细规格
 │   ├── cognition.md          # Prompt 工程 + RL 循环
-│   ├── safety.md             # 安全系统设计
+│   ├── tasks.md              # 任务系统设计
+│   ├── safety.md             # 安全与错误处理设计
 │   ├── protocol.md           # 通信协议规范
 │   ├── extending.md          # 扩展指南
 │   └── deployment.md         # 部署指南
@@ -490,10 +508,689 @@ telos/
 
 ---
 
-## 10. 待后续讨论
+## 10. 任务系统
 
-- ☐ 电源系统 — 太阳能充电方案、电池管理
-- ☐ 循环细节 — Agent 循环的精确时序和并发模型
-- ☐ 程序记忆的具体实现 — JSON 技能库 vs 向量检索
-- ☐ RL 反思的具体格式 — 如何自动化提取改进策略
-- ☐ STM32 固件架构 — 原语指令的固件层实现
+### 10.1 为什么需要任务系统
+
+当前 `AgentConfig.task = "探索环境"` 只是一段字符串。真实场景中，复杂任务（如"去B区给西红柿喷药"）LLM 无法一步完成——它不知道 B 区在哪、不知道西红柿长什么样、不知道喷药需要多少流量。任务系统负责**分解、调度、跟踪**，让 LLM 专注于"当前子目标"的决策。
+
+### 10.2 任务层次结构
+
+```
+用户指令: "去B区给西红柿喷药"
+     │
+     ▼
+┌──────────────────────────────┐
+│        任务分解 (LLM)         │
+│                              │
+│  1. 导航到B区                 │
+│  2. 在B区扫描识别西红柿        │
+│  3. 对每株西红柿喷洒农药       │
+│  4. 报告完成                  │
+└──────────┬───────────────────┘
+           │
+           ▼
+┌──────────────────────────────┐
+│       子任务 DAG              │
+│                              │
+│  [导航B区] ──→ [扫描B区]     │
+│                  │           │
+│                  ▼           │
+│             [喷洒] ←── 循环   │
+│                  │           │
+│                  ▼           │
+│             [报告]           │
+└──────────────────────────────┘
+```
+
+### 10.3 子任务数据结构
+
+```python
+@dataclass
+class SubTask:
+    id: str
+    description: str          # "在B区扫描识别西红柿"
+    status: TaskStatus        # pending | running | done | failed | cancelled
+    dependencies: list[str]   # 依赖的前置子任务ID
+    priority: int             # 数字越小越优先
+    retry_count: int = 0
+    max_retries: int = 3
+
+    # 完成条件 — 可被验证
+    completion_criteria: dict  # {"type": "scan_and_detect", "target": "tomato"}
+
+    # 失败时的回退
+    on_fail: str              # "skip" | "retry" | "abort" | "ask_user"
+
+@dataclass
+class Task:
+    id: str
+    user_command: str          # 原始用户指令
+    subtasks: list[SubTask]
+    status: TaskStatus
+    created_at: float
+```
+
+### 10.4 任务生命周期
+
+```
+用户指令
+  │
+  ▼
+LLM 分解 → 生成子任务 DAG
+  │
+  ▼
+任务队列 (优先级排序)
+  │
+  ├── 取最高优先级的 pending 子任务
+  │     │
+  │     ▼
+  │  子任务作为"当前目标"注入 LLM Context
+  │     │
+  │     ▼
+  │  Agent 循环执行 → 检查 completion_criteria
+  │     │
+  │     ├── 满足 → 标记 done → 触发下一个子任务
+  │     │
+  │     └── 不满足 → 重试 (最多 max_retries 次)
+  │                    │
+  │                    └── 耗尽 → on_fail 策略
+  │
+  ▼
+全部子任务 done → 任务完成 → 语音报告
+```
+
+### 10.5 中断与抢占
+
+- **中断**: 更高优先级任务入队时（用户说"停！先去做X"），当前子任务挂起，保存状态，切换到新任务
+- **抢占**: 当前子任务被打断后，恢复时从挂起点继续（依赖情景记忆中的轨迹状态）
+- **安全中断最高优先级**: EMERGENCY 状态直接清除任务队列
+
+### 10.6 与 LLM 的接口
+
+任务系统每次只向 LLM 暴露**当前子任务**的上下文，而不是整个 DAG：
+
+```
+System Prompt 注入:
+  当前子任务: "扫描B区找到所有西红柿"
+  进度: 子任务 2/4
+  前置条件: [导航B区 ✓]
+  完成标准: 识别到 ≥3 株西红柿
+  
+User Message 注入:
+  任务: 扫描B区找到所有西红柿
+  状态: <Observation>
+```
+
+这样 LLM 每次只需要聚焦一个具体目标，不需要理解全局 DAG。
+
+---
+
+## 11. 错误处理体系
+
+### 11.1 设计原则
+
+> **错误是常态，不是异常。** 机器人运行在不可控的物理世界中，传感器会坏、网络会断、电机会堵转。系统必须在设计阶段就假设每一个组件都可能以各种方式出错。
+
+### 11.2 错误分类
+
+| 类别 | 示例 | 检测方式 | 恢复策略 |
+|------|------|---------|---------|
+| **传感器错误** | 摄像头断连、TOF 读取超时、IMU 漂移 | 超时/校验和/合理性检查 | 降级运行、标记故障传感器 |
+| **执行器错误** | 电机堵转、舵机卡死、泵空转 | 电流异常(>额定2x)/速度反馈异常 | 停该执行器、语音报警、尝试反向释放 |
+| **通信错误** | STM32 无响应、WiFi 断连、API 超时 | 超时/ACK 缺失/序列号跳跃 | 重试→降级→安全停止 |
+| **感知错误** | ASR 误识别、视觉目标误判 | 置信度阈值、时序一致性检查 | 请求确认、使用上下文纠正 |
+| **资源错误** | 电量低于20%、存储满、温度过高 | 阈值监控、趋势预测 | 低电量返航、清理旧日志、散热 |
+| **逻辑错误** | 动作序列矛盾、LLM 输出格式错误 | 输出校验、JSON 解析失败 | 拒绝执行、请求重新生成 |
+
+### 11.3 错误处理流程
+
+```
+错误发生
+  │
+  ▼
+┌──────────────────┐
+│ 1. 检测 & 分类   │ ← 每个组件都有 health() 方法
+└────────┬─────────┘
+         ▼
+┌──────────────────┐
+│ 2. 隔离          │ ← 错误只影响该组件，不传播
+│   actuator.set   │    其他执行器继续运行
+│   _error_flag()  │
+└────────┬─────────┘
+         ▼
+┌──────────────────┐
+│ 3. 恢复尝试      │
+│  Level 1: 自动重试│ ← 3次，指数退避
+│  Level 2: 自我修复│ ← 电机反转释放堵转/重启传感器
+│  Level 3: 降级    │ ← 失去视觉→改用超声+本体感
+│  Level 4: 安全停止│ ← 无法降级→语音报警+等待指令
+└────────┬─────────┘
+         ▼
+┌──────────────────┐
+│ 4. 记录 & 学习   │ ← 错误类型+上下文写入情景记忆
+│  供 RL 反思分析   │    下次遇到类似场景提前预警
+└──────────────────┘
+```
+
+### 11.4 组件健康矩阵
+
+每个组件必须实现 `health()` 方法：
+
+```python
+class ComponentHealth:
+    status: HealthStatus    # healthy | degraded | failed
+    error_count: int
+    last_error: Optional[str]
+    last_success: float     # 上次成功操作的时间戳
+    self_check_results: dict  # 各项自检的详细结果
+
+# 每个 Actuator / PerceptionChannel / Comm 都必须实现
+def health(self) -> ComponentHealth: ...
+```
+
+### 11.5 ASR 误识别的特殊处理
+
+语音指令误识别可能导致危险动作。需要双重确认：
+
+```python
+class VoiceChannel:
+    def capture(self) -> dict:
+        text = asr_result
+
+        # 危险指令检测
+        if any(word in text for word in ["急停", "停止", "关", "救命"]):
+            return {"text": text, "is_critical": True, "confirmed": True}
+
+        # 普通指令 — 低置信度时请求确认
+        if confidence < 0.7:
+            TTS.speak(f"你刚才说的是 '{text}' 吗？")
+            return {"text": text, "needs_confirmation": True}
+
+        return {"text": text}
+```
+
+---
+
+## 12. 初始化与自检系统
+
+### 12.1 为什么需要
+
+机器人不是按下开关就能用的。上电后：执行器不在零位、IMU 需要标定、STM32 需要握手、能力清单需要构建。没有系统的启动流程，机器人会在错误的状态下开始执行任务。
+
+### 12.2 启动序列
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     启动自检序列 (Boot Sequence)              │
+│                                                              │
+│  Phase 1: 通信建立 (100ms)                                    │
+│    STM32 握手 → 读取固件版本 → 确认通信链路                   │
+│    ESP32 握手 → 确认 WiFi 连接 → 获取 IP                      │
+│                                                              │
+│  Phase 2: 传感器自检 (500ms)                                   │
+│    摄像头 → 采集测试帧 → 检查亮度/对比度                       │
+│    IMU → 读取静止数据 → 零偏标定                               │
+│    TOF → 测试读数 → 检查范围                                   │
+│    麦克风 → 录音静音片段 → 检查噪声底                         │
+│                                                              │
+│  Phase 3: 执行器自检 (1-3s)                                    │
+│    每个执行器依次执行:                                         │
+│      init() → 回零点 → 微动测试 → 检测电流 → 回零              │
+│    motor:  1° 微动 → 电流正常? → 回零                          │
+│    servo:  小角度摆动 → 确认响应 → 回零                        │
+│    pump:   短时脉冲(100ms) → 电流正常? → 停止                  │
+│    laser:  仅电路自检，不发射 (安全!)                           │
+│                                                              │
+│  Phase 4: 能力清单构建                                         │
+│    收集所有通过自检的执行器 → 生成能力列表                       │
+│    收集所有通过自检的传感器 → 生成感知清单                      │
+│    确定运行模式: full / degraded (部分组件失败)                  │
+│                                                              │
+│  Phase 5: 就绪声明                                             │
+│    语音播报: "系统初始化完成，3 个执行器，4 个传感器就绪"       │
+│    检测到故障: "警告: 右电机自检失败，已禁用。建议检查。"       │
+│    状态: IDLE，等待任务                                        │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 12.3 降级运行
+
+如果部分组件自检失败，系统进入降级模式：
+
+```python
+class DegradedMode:
+    """系统降级运行配置"""
+    missing_camera → 禁用视觉感知，仅用本体感+TOF
+    missing_one_motor → 限制速度 50%，禁用转弯
+    missing_TOF → 降低前进速度至 0.3m/s
+    missing_STM32 → 无法运行，必须修复
+    degraded → 语音告知用户当前能力受限
+```
+
+### 12.4 热插拔与动态重检
+
+- 执行器在运行中被拔出/插入 → 检测到连接状态变化 → 触发热自检 → 更新能力清单
+- 传感器恢复 → 重新校准 → 从降级恢复到完全能力
+
+---
+
+## 13. 可观测性
+
+### 13.1 设计目标
+
+> **不出问题时不需要看，出问题时能回溯到每毫秒每条指令。**
+
+### 13.2 分层日志
+
+```python
+# Level 0: 关键事件 (始终记录)
+logger.event("system.boot", {"actuators": 3, "sensors": 4, "mode": "full"})
+logger.event("task.start", {"task_id": "t1", "subtask": "导航B区"})
+logger.event("task.done", {"task_id": "t1", "duration": 45.2})
+logger.event("error.collision", {"speed": 0.5, "obstacle": "wall"})
+logger.event("emergency.stop", {"reason": "tilt", "angle": 47.2})
+
+# Level 1: 决策轨迹 (每次LLM调用记录)
+logger.decision({
+    "step": 42, "timestamp": 1234567890.123,
+    "observation_summary": "...",
+    "llm_thought": "前方有障碍物，需要右转...",
+    "actions": [{"actuator": "left_motor", "action": "set_speed", "params": ...}],
+    "llm_latency_ms": 380
+})
+
+# Level 2: 执行细节 (每个动作执行记录)
+logger.action({
+    "step": 42, "actuator": "left_motor",
+    "action": "set_speed", "params": {"rpm": 500},
+    "result": "ok", "state_after": {"rpm": 498}
+})
+
+# Level 3: 调试 (开发时开启，运行时关闭)
+logger.debug("perception.vision.capture: 224KB JPEG, 32ms")
+logger.debug("memory.working.update: 5 items in buffer")
+```
+
+### 13.3 关键指标
+
+| 指标 | 含义 | 告警阈值 |
+|------|------|---------|
+| `llm_latency_p50` | LLM 响应中位数 | > 2s 告警 |
+| `llm_error_rate` | LLM API 调用失败率 | > 10% |
+| `action_success_rate` | 动作执行成功率 | < 95% |
+| `stm32_heartbeat_age` | 距上次 STM32 心跳的时间 | > 1s (断连) |
+| `battery_level` | 当前电量 | < 20% 低电量 |
+| `motor_temp_max` | 最高电机温度 | > 80°C |
+| `derived_speed` | 实际速度与指令速度偏差 | > 20% (打滑/堵转) |
+
+### 13.4 轨迹回放
+
+```python
+# 存储: 每条 epirodic_memory 记录含完整的 Observation + Decision + Results
+# 回放: 加载指定时间段的记录 → 逐帧重现在前端
+# 用途: 分析为什么在某处做了某个决策、LLM 思考过程可视化
+```
+
+---
+
+## 14. 人机协同
+
+### 14.1 四种协同模式
+
+```
+完全自主 ←──────────────────────────────→ 完全手动
+
+  AUTO          SUPERVISED         APPROVAL          MANUAL
+  全自动        监督模式            审批模式           手动模式
+  ──────────    ──────────         ──────────         ──────────
+  机器人独立    机器人决策+执行    机器人提议         人类通过操纵杆
+  决策+执行    人类可随时打断      人类确认后执行     直接控制
+
+  适用:         适用:              适用:              适用:
+  导航、探索    日常任务            危险动作           紧急情况
+  (低风险)      (中风险)           (激光、化学品)     (系统故障)
+```
+
+### 14.2 模式切换
+
+```
+用户语音: "进入审批模式"  →  mode = APPROVAL
+用户语音: "自己来吧"      →  mode = AUTO
+急停按钮按下              →  mode = MANUAL (硬件强制)
+系统检测到需要确认        →  暂时进入 APPROVAL (单次)
+```
+
+### 14.3 审批机制
+
+```python
+class ApprovalManager:
+    def request_approval(self, action: dict, reason: str) -> bool:
+        """请求用户确认危险动作"""
+        TTS.speak(f"需要确认: {reason}。允许吗?")
+
+        # 等待语音回复 (yes/no) 或超时
+        response = self._wait_for_confirmation(timeout=10.0)
+        if response is None:
+            return False  # 超时 = 拒绝
+        return response
+
+    # 需要审批的动作
+    requires_approval = [
+        "EnergyBeam.fire",   # 激光发射
+        "Pump.set_flow > 0.5",  # 大流量喷洒
+        "speed > 1.0",       # 高速移动
+    ]
+```
+
+### 14.4 行为解释 (Explainable Agent)
+
+每次决策后，Agent 应该能解释自己的行为：
+
+```
+用户: "你为什么停下来?"
+Agent: "两秒前TOF检测到前方25cm有障碍物，
+        我判断无法绕过，正在等待你的指令。"
+
+实现: LLM 的 thought 字段转为语音播报
+     情景记忆支持 "最近N步做了什么" 的查询
+```
+
+### 14.5 远程监控面板 (未来)
+
+```
+┌────────────────────────────────────────────────┐
+│  Telos Monitor                    [ AUTO ▼ ]   │
+│                                                │
+│  ┌──────────────┐  ┌──────────────────────────┐│
+│  │  摄像头画面    │  │  机器人状态               ││
+│  │              │  │  速度: 0.3 m/s            ││
+│  │   [实时]     │  │  航向: 145°               ││
+│  │              │  │  电量: 87% ████████░░     ││
+│  │              │  │  模式: SUPERVISED         ││
+│  └──────────────┘  └──────────────────────────┘│
+│                                                │
+│  ┌────────────────────────────────────────────┐│
+│  │  最近决策                                    ││
+│  │  [12:03:42] 右转30°避开椅子  ✓              ││
+│  │  [12:03:40] LLM决策: 前方障碍，右转          ││
+│  │  [12:03:37] 前进0.3m/s  ✓                   ││
+│  └────────────────────────────────────────────┘│
+│                                                │
+│  ┌──────────┐ ┌──────────┐ ┌────────────────┐  │
+│  │   急停    │ │  回充    │ │  任务: 探索...  │  │
+│  └──────────┘ └──────────┘ └────────────────┘  │
+└────────────────────────────────────────────────┘
+```
+
+---
+
+## 15. 世界模型与空间表征
+
+### 15.1 为什么需要
+
+当前记忆系统只存储"事件"，不存储"空间"。没有空间表征的机器人：
+- 每次任务从零探索
+- 不知道 B 区在自己北边还是东边
+- 无法做"回充电桩"这种需要位置记忆的任务
+- 每次绕同一个障碍物像第一次见到
+
+### 15.2 三层空间表征
+
+```
+Layer 1: 局部代价地图 (Local Costmap)
+  ─────────────────────────────────
+  范围: 机器人周围 5m × 5m
+  分辨率: 5cm/格
+  更新: 实时 (TOF/超声/摄像头)
+  用途: 即时避障、局部路径规划
+  实现: 2D 占据栅格 (numpy array)
+  存储: 内存，不持久化
+
+Layer 2: 拓扑地图 (Topological Map)
+  ─────────────────────────────────
+  范围: 整个工作区域
+  内容: 节点=关键位置(充电桩/房间入口/作业区)
+         边=可通行路径 + 距离
+  更新: 每次任务发现新节点或路径
+  用途: 全局导航 ("去B区" = 在拓扑图上找路径)
+  实现: NetworkX 图 + JSON 持久化
+  存储: SQLite / JSON 文件
+
+Layer 3: 语义地图 (Semantic Map)
+  ─────────────────────────────────
+  范围: 整个工作区域
+  内容: 房间标签("厨房"/"B区")、物体位置("西红柿在第3行")
+        危险区域("斜坡"/"水坑")
+  更新: LLM 识别 + 人工标注
+  用途: 人类可理解的场景 ("去厨房" = 找标签为"厨房"的节点)
+  实现: 拓扑图节点带标签 + 物体索引
+  存储: SQLite
+```
+
+### 15.3 空间与记忆的整合
+
+```
+情景记忆中的每条轨迹记录:
+  {step: 42, action: "前进", position: (1.5, 3.2, 0°), ...}
+                      ↑
+                  从 STM32 里程计/IMU 推算的位姿
+
+任务结束后:
+  轨迹点序列 → 更新拓扑地图 (添加新发现的路径)
+  LLM 识别场景 → 标注语义 ("这个区域有很多西红柿")
+```
+
+### 15.4 开机恢复
+
+```
+系统启动 →
+  加载上次保存的拓扑地图 (JSON)
+  加载语义标注 (SQLite)
+  ├── 有上次地图 → "我在哪?" → 扫描周围特征 → 定位 → 继续
+  └── 无地图 → "第一次来" → 从零建图
+```
+
+---
+
+## 16. 电源管理
+
+### 16.1 设计目标
+
+- 支持太阳能充电（你明确提出的需求）
+- 电量感知：每个决策都要考虑功耗
+- 自动返航：低电量时安全返回充电桩
+- 电池健康：长期管理充放电，延长电池寿命
+
+### 16.2 电源状态模型
+
+```python
+@dataclass
+class PowerState:
+    battery_level: float          # 0-100%
+    voltage: float                # 电池电压 (V)
+    current_draw: float           # 当前总电流 (A)
+    solar_power: float            # 太阳能板输出功率 (W)
+
+    # 计算
+    estimated_runtime: float      # 当前功耗下剩余时间 (分钟)
+    is_charging: bool
+    charging_source: str          # "solar" | "dock" | "none"
+
+class PowerBudget:
+    """功耗预算 — 每个决策前检查"""
+    available: float              # 当前可用功率 (W)
+    allocated: dict[str, float]   # {"motors": 80, "laser": 150, "compute": 20}
+```
+
+### 16.3 低电量策略
+
+```
+电量阈值  行为
+────────  ──────────────────────────────
+> 50%     正常模式，所有功能可用
+30-50%    节能模式，限制大功率执行器 (激光、高速移动)
+20-30%    警告模式，语音提醒用户，禁用激光
+10-20%    返航模式，中断当前任务 → 导航到充电桩
+< 10%     紧急模式，关闭所有非必要组件 → 原地等待救援
+```
+
+### 16.4 太阳能充电策略
+
+```
+太阳能板 ──→ MPPT 充电控制器 ──→ 电池
+
+充电状态下的行为:
+  ┌──────────────────────────────────┐
+  │ 充电中 (太阳能):                   │
+  │  - 电池 > 80%: 正常运行             │
+  │  - 电池 50-80%: 轻量任务 (巡逻/监测) │
+  │  - 电池 < 50%: 待机充电，不执行任务   │
+  │                                   │
+  │ 充电中 (座充):                     │
+  │  - 休眠充电，直到电池 > 90%         │
+  │  - 期间: 软件更新、日志清理、        │
+  │           离线分析、模型同步         │
+  └──────────────────────────────────┘
+```
+
+### 16.5 决策中的功耗感知
+
+LLM 的认知推理应该考虑功耗：
+
+```
+System Prompt 注入:
+  当前功耗预算: 150W 可用
+  左电机(50W) + 右电机(50W) + 激光(100W) = 200W → 超预算!
+  → 如果使用激光，必须降低速度 (电机各 25W)
+```
+
+---
+
+## 17. 多智能体协调 (演进)
+
+### 17.1 演进路径
+
+```
+Phase 1 (当前): 单机器人完整闭环 ← 我们现在在这里
+Phase 2: 双机器人共享地图 (拓扑地图同步)
+Phase 3: 多机器人任务分配 (分工: A导航+B采集+C搬运)
+Phase 4: 群体涌现 (隐式通信/环境痕迹/角色自适应)
+```
+
+### 17.2 预留的扩展点
+
+```python
+class AgentNetwork:
+    """多智能体协调网络 — Phase 2+ 使用"""
+    agents: dict[str, AgentInfo]   # 已知的其他Agent
+    shared_map: TopologicalMap     # 共享拓扑地图
+    message_queue: asyncio.Queue   # 异步消息
+
+    def discover_agents(self) -> list[AgentInfo]: ...
+    def broadcast(self, msg: dict) -> None: ...
+    def request_help(self, task: str) -> Optional[str]: ...
+```
+
+### 17.3 通信方式
+
+| 层 | 方式 | 延迟 | 用途 |
+|------|------|------|------|
+| 环境痕迹 | 拓扑地图标注 "Agent A 在探索 B 区" | 秒级 | 避免重复探索 |
+| 直接消息 | MQTT广播 → 所有 Agent | 100ms | 任务分配、求助 |
+| 云端协调 | 共享任务队列 | 500ms+ | 全局任务调度 |
+
+---
+
+## 18. 仿真测试环境 (演进)
+
+### 18.1 为什么需要
+
+- 真实机器人测试成本高（碰撞损坏、时间消耗、需要物理空间）
+- 算法迭代需要快速反馈
+- RL 反思循环需要大量试错
+
+### 18.2 仿真方案
+
+```
+Phase 1 (当前): Dry-run 模式 — 不接硬件，不调 API，只验证架构逻辑
+Phase 2: 简单仿真 — Python 内建 2D Grid 仿真 (复用 SomatoMind env/gridworld.py)
+Phase 3: 物理仿真 — ROS2 + Gazebo / MuJoCo (配合 robot 项目)
+```
+
+### 18.3 仿真接口抽象
+
+```python
+class Environment(Protocol):
+    """仿真与真实环境的统一接口"""
+    def step(self, actions: list[dict]) -> Observation: ...
+    def reset(self) -> Observation: ...
+
+# 真实环境
+class RealEnvironment(Environment):
+    # 使用 PerceptionManager + Executor + STM32
+
+# 仿真环境
+class SimEnvironment(Environment):
+    # 使用仿真引擎 + 虚拟传感器 + 虚拟执行器
+```
+
+---
+
+## 19. 对话身份一致性 (演进)
+
+### 19.1 问题
+
+Telos 的语音交互可能听起来像 "冷冰冰的工具" 或 "人格分裂"——每次调用 LLM 都是独立上下文，没有稳定的人格。
+
+### 19.2 设计
+
+```
+System Prompt 固定的人格定义:
+  "你是 Telos，一个友好、细心、略带幽默感的机器人助手。
+   你说话简洁，不喜欢啰嗦。
+   你对自己不确定的事情会坦率承认。
+   你的主人是张帅清，你叫他"帅清"。
+   
+   今天的日期是 {date}，时间是 {time}。
+   你上次执行任务是在 {last_task_time}，完成了 {last_task_result}。"
+```
+
+### 19.3 跨会话记忆
+
+情景记忆中的"对话历史"跨会话保留：
+```
+用户: "记住，厨房的花瓶是易碎品"
+→ 存入语义地图: kitchen.vase = fragile
+→ 下次靠近花瓶时自动减速
+```
+
+---
+
+## 20. 外部系统集成 (演进)
+
+### 20.1 待集成的系统
+
+| 系统 | 集成方式 | 用途 |
+|------|---------|------|
+| Home Assistant | REST API | 控制智能家居设备、获取传感器数据 |
+| 天气 API | HTTP GET | 户外任务前检查天气 |
+| 邮件/通知 | SMTP | 完成任务/异常时通知 |
+| GitHub | API | OTA 更新代码和配置 |
+| 手机 App | MQTT | 推送通知、接收指令 |
+
+### 20.2 集成接口设计
+
+```python
+class Integration(Protocol):
+    name: str
+    def connect(self) -> bool: ...
+    def disconnect(self) -> None: ...
+    def health(self) -> dict: ...
+
+class HomeAssistantIntegration(Integration):
+    """与 Home Assistant 集成 — 复用 CareLink 项目配置"""
+    name = "home_assistant"
+    def get_sensor(self, entity_id: str) -> dict: ...
+    def call_service(self, domain: str, service: str, data: dict) -> bool: ...
+```
