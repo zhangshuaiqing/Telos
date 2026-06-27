@@ -15,6 +15,9 @@
 7. [EnergyBeam — 定向能量输出](#7-energybeam--定向能量输出)
 8. [原语组合模式](#8-原语组合模式)
 9. [新增原语检查清单](#9-新增原语检查清单)
+10. [功耗规格](#10-功耗规格)
+11. [STM32 命令字映射](#11-stm32-命令字映射)
+12. [标定参数格式](#12-标定参数格式)
 
 ---
 
@@ -672,3 +675,419 @@ class Sprayer:
 - [ ] 更新 Executor 的注册逻辑
 - [ ] 更新认知引擎 Prompt 中的能力清单生成逻辑
 - [ ] 更新本文档
+
+---
+
+## 10. 功耗规格
+
+### 10.1 设计目的
+
+Ch16 电源管理的功耗预算是以每个执行器为基础的。LLM 做决策时需要知道"开激光就不能同时高速行驶"。每个原语必须声明功耗。
+
+### 10.2 各原语功耗
+
+| 原语 | 硬件示例 | 待机 (W) | 额定 (W) | 峰值 (W) | 电机效率 |
+|------|---------|---------|---------|---------|---------|
+| RotaryVelocity (小) | DC 电机 12V 10W | 0 | 10 | 15 | 70% |
+| RotaryVelocity (中) | BLDC 轮毂 150W | 2 | 150 | 300 | 85% |
+| RotaryVelocity (大) | BLDC 500W | 5 | 500 | 1000 | 90% |
+| RotaryPosition | 舵机 MG996 | 0.1 | 3 | 6 | — |
+| RotaryPosition | 步进 NEMA17 | 1 | 10 | 15 | 60% |
+| LinearPosition | 电动推杆 12V | 0 | 30 | 50 | 65% |
+| BinaryActuator | 电磁阀 | 0 | 5 | 8 | — |
+| BinaryActuator | 继电器 | 0.5 | 1 | 1 | — |
+| Pump (小) | 蠕动泵 12V | 0 | 10 | 15 | — |
+| Pump (中) | 隔膜泵 12V | 0.5 | 50 | 70 | — |
+| Pump (大) | 离心泵 24V | 1 | 200 | 350 | — |
+| Gripper | 舵机夹爪 | 0.1 | 3 | 6 | — |
+| EnergyBeam | 激光 150W | 2 | 150 | 180 | 30-50% |
+| EnergyBeam | UV LED 30W | 0.5 | 30 | 35 | 40% |
+| EnergyBeam | 红外加热 300W | 1 | 300 | 320 | 90% |
+
+### 10.3 功耗声明接口
+
+```python
+@dataclass
+class PowerSpec:
+    standby_w: float = 0.0        # 待机功耗 (启用但未动作)
+    rated_w: float = 0.0          # 额定功率 (正常负载)
+    peak_w: float = 0.0           # 峰值功率 (启动/堵转)
+    efficiency: float = 1.0       # 转换效率 (0-1)
+    voltage: float = 12.0         # 额定电压 (V)
+
+# 每个 Actuator 必须实现
+class RotaryVelocity:
+    def get_power_spec(self) -> PowerSpec:
+        return PowerSpec(
+            standby_w=2.0,
+            rated_w=abs(self._speed) / self._max_speed * 150,
+            peak_w=300,
+            efficiency=0.85,
+            voltage=24.0
+        )
+
+    def get_current_power(self) -> float:
+        """当前实际功耗"""
+        if self.state == ActuatorState.IDLE:
+            return self.get_power_spec().standby_w
+        load_ratio = abs(self._speed) / max(1, self._max_speed)
+        return load_ratio * self.get_power_spec().rated_w
+```
+
+### 10.4 系统级功耗汇总
+
+```python
+class PowerBudget:
+    """每个决策前检查总功耗是否超预算"""
+    
+    def __init__(self, total_budget_w: float):
+        self.total_budget = total_budget_w
+    
+    def check(self, planned_actions: list[dict]) -> dict:
+        """预估动作序列的总功耗"""
+        total = 0.0
+        breakdown = {}
+        
+        for action in planned_actions:
+            act_name = action["actuator"]
+            actuator = self.actuators[act_name]
+            power = actuator.get_current_power()
+            total += power
+            breakdown[act_name] = power
+        
+        return {
+            "total_w": total,
+            "breakdown": breakdown,
+            "within_budget": total <= self.total_budget,
+            "headroom_w": self.total_budget - total,
+        }
+```
+
+---
+
+## 11. STM32 命令字映射
+
+### 11.1 通信帧格式 (重述)
+
+```
+┌──────┬──────┬──────────┬──────────┬──────────┬──────┐
+│SYNC  │ ADDR │ TYPE     │ CMD      │ PAYLOAD  │ CRC  │
+│0xAA  │ 1B   │ 1B       │ 1B       │ N bytes  │ 2B   │
+└──────┴──────┴──────────┴──────────┴──────────┴──────┘
+
+SYNC:  0xAA — 帧同步头
+ADDR:  执行器地址 (0x01-0x7F, 0x00=广播)
+TYPE:  原语类型
+CMD:   具体命令
+PAYLOAD: 可变长度数据
+CRC:   CRC-16/MODBUS (全帧校验，不含SYNC)
+```
+
+### 11.2 原语类型编码
+
+| TYPE | 原语 | 说明 |
+|------|------|------|
+| `0x01` | RotaryVelocity | 连续旋转+速度 |
+| `0x02` | RotaryPosition | 角度定位 |
+| `0x03` | LinearPosition | 直线定位 |
+| `0x04` | BinaryActuator | 开关 |
+| `0x05` | Pump | 流体控制 |
+| `0x06` | Gripper | 抓取 |
+| `0x07` | EnergyBeam | 能量束 |
+| `0x00` | 广播/系统 | 急停、查询、心跳 |
+
+### 11.3 各原语命令字
+
+#### 11.3.1 RotaryVelocity (TYPE=0x01)
+
+| CMD | 名称 | Payload | 响应 | 说明 |
+|------|------|------|------|------|
+| `0x10` | SET_SPEED | int16 (rpm, 小端) | ACK + int16 (实际rpm) | 正=正转, 负=反转 |
+| `0x11` | STOP | — | ACK | 减速到0 |
+| `0x12` | GET_SPEED | — | ACK + int16 (rpm) | 查询当前转速 |
+| `0x1F` | GET_STATE | — | ACK + state_byte | 查询状态 |
+
+```
+示例: 左电机 (ADDR=0x01) 设置 1200 rpm
+  →  0xAA 01 01 10  04B0   [CRC]
+              设置  +1200 (0x04B0=1200 小端)
+  
+  响应: 0xAA 01 01 10  04B0  04AD [CRC]
+                       设置  实际1197rpm (0x04AD)
+```
+
+#### 11.3.2 RotaryPosition (TYPE=0x02)
+
+| CMD | 名称 | Payload | 说明 |
+|------|------|------|------|
+| `0x20` | SET_ANGLE | int16 (角度×10, 小端) | 如45.5° → 455 (0x01C7) |
+| `0x21` | GET_ANGLE | — | 返回 int16 (角度×10) |
+| `0x22` | SET_ZERO | — | 当前位置标记为0点 |
+
+#### 11.3.3 LinearPosition (TYPE=0x03)
+
+| CMD | 名称 | Payload | 说明 |
+|------|------|------|------|
+| `0x30` | SET_POSITION | int16 (mm×10, 小端) | 如125.5mm → 1255 |
+| `0x31` | GET_POSITION | — | 返回 int16 |
+| `0x32` | HOME | — | 回零点 |
+
+#### 11.3.4 BinaryActuator (TYPE=0x04)
+
+| CMD | 名称 | Payload | 说明 |
+|------|------|------|------|
+| `0x40` | ON | — | 开启 |
+| `0x41` | OFF | — | 关闭 |
+| `0x42` | TOGGLE | — | 翻转 |
+| `0x43` | PULSE | uint16 (ms, 小端) | 开启N毫秒后自动关 |
+
+#### 11.3.5 Pump (TYPE=0x05)
+
+| CMD | 名称 | Payload | 说明 |
+|------|------|------|------|
+| `0x50` | SET_FLOW | uint16 (流量×100, 小端) | 如0.5 L/min → 50 |
+| `0x51` | STOP | — | 停止 |
+| `0x52` | GET_FLOW | — | 返回 uint16 |
+
+#### 11.3.6 Gripper (TYPE=0x06)
+
+| CMD | 名称 | Payload | 说明 |
+|------|------|------|------|
+| `0x60` | GRASP | — | 抓取 |
+| `0x61` | RELEASE | — | 释放 |
+| `0x62` | GRASP_FORCE | uint16 (力×10, N, 小端) | 以指定力抓取 |
+
+#### 11.3.7 EnergyBeam (TYPE=0x07)
+
+| CMD | 名称 | Payload | 说明 |
+|------|------|------|------|
+| `0x70` | SET_POWER | uint16 (W, 小端) | 设置功率 |
+| `0x71` | FIRE | uint16 (ms, 小端) | 发射指定时长 |
+| `0x72` | STOP | — | 停止发射 |
+
+> ⚠ **EnergyBeam 需要双因子触发**: 软件命令 + STM32 硬件 Enable 引脚同时为高才发射。
+
+#### 11.3.8 系统命令 (TYPE=0x00, ADDR=0x00 广播)
+
+| CMD | 名称 | Payload | 说明 |
+|------|------|------|------|
+| `0xFF` | EMERGENCY_STOP | — | 所有执行器急停 (广播) |
+| `0xFE` | HEARTBEAT_REQ | — | 请求心跳 |
+| `0xFD` | HEARTBEAT_ACK | uint8 (状态) | 心跳回复 |
+| `0xFC` | QUERY_CAPABILITY | — | 查询该地址执行器能力 |
+| `0xFB` | CAPABILITY_REPORT | 结构化数据 | 回传能力描述 |
+| `0xFA` | SHUTDOWN | — | 准备断电 |
+
+### 11.4 响应帧格式
+
+```
+┌──────┬──────┬──────────┬──────────┬──────────┬──────────┬──────┐
+│SYNC  │ ADDR │ TYPE     │ CMD      │ STATUS   │ DATA     │ CRC  │
+│0xAA  │ 1B   │ 1B       │ 1B       │ 1B       │ N bytes  │ 2B   │
+└──────┴──────┴──────────┴──────────┴──────────┴──────────┴──────┘
+
+STATUS:
+  0x00 = ACK (成功)
+  0x01 = NACK (参数错误)
+  0x02 = BUSY (前一个命令未完成)
+  0x03 = ERROR (故障, DATA字段含错误码)
+  0x04 = NOT_READY (未初始化或自检中)
+```
+
+### 11.5 端侧发送示例
+
+```python
+class STM32CommandEncoder:
+    """将 Actuator 动作编码为 STM32 二进制帧"""
+    
+    def encode(self, action: dict) -> bytes:
+        actuator_id = action["actuator"]  # "left_motor"
+        action_name = action["action"]    # "set_speed"
+        params = action.get("params", {})
+        
+        addr = self.get_address(actuator_id)
+        actuator_type = self.get_type(actuator_id)
+        cmd_code, payload = self._encode_action(actuator_type, action_name, params)
+        
+        frame = bytes([0xAA, addr, actuator_type, cmd_code]) + payload
+        crc = crc16_modbus(frame)  # 校验 SYNC 之后的所有字节
+        return frame + crc.to_bytes(2, 'little')
+    
+    def _encode_action(self, atype: int, action: str, params: dict):
+        if atype == 0x01:  # RotaryVelocity
+            if action == "set_speed":
+                rpm = int(params["rpm"])
+                return 0x10, rpm.to_bytes(2, 'little', signed=True)
+            elif action == "stop":
+                return 0x11, b''
+        elif atype == 0x02:  # RotaryPosition
+            if action == "set_angle":
+                angle_x10 = int(params["deg"] * 10)
+                return 0x20, angle_x10.to_bytes(2, 'little', signed=True)
+        # ... 其他原语和动作
+    
+    def decode_response(self, frame: bytes) -> dict:
+        """解析 STM32 的响应帧 → Python dict"""
+        addr, atype, cmd, status = frame[1], frame[2], frame[3], frame[4]
+        data = frame[5:-2]  # 去掉 CRC
+        
+        return {
+            "address": addr,
+            "type": atype,
+            "command": cmd,
+            "status": ["ACK", "NACK", "BUSY", "ERROR", "NOT_READY"][status],
+            "data": data.hex(),
+        }
+```
+
+---
+
+## 12. 标定参数格式
+
+### 12.1 为什么需要标定
+
+执行器的参数不是"装上去就对"的。同一型号的不同个体有差异，安装时也有机械偏差。标定数据是让软件"认识"具体硬件的桥梁。
+
+### 12.2 各原语需标定的参数
+
+| 原语 | 标定项 | 标定方法 | 持久化 |
+|------|--------|---------|--------|
+| RotaryVelocity | PID 增益 (kp/ki/kd) | 阶跃响应测试 → 调参 | ✅ |
+| RotaryVelocity | 编码器零点偏移 | 静止时读编码器值 | ✅ |
+| RotaryPosition | 机械零点 | 限位开关 + 回零 | ✅ |
+| RotaryPosition | 角度映射 (PWM→角度) | 三点标定 (0°, 90°, 180°) | ✅ |
+| LinearPosition | 机械零点 + 限位 | 硬限位触发位置 | ✅ |
+| LinearPosition | 步进/mm 换算比 | 移动100mm → 计数脉冲 | ✅ |
+| BinaryActuator | — (无需标定) | — | — |
+| Pump | 流量曲线 (PWM→L/min) | 量筒实测 | ✅ |
+| Gripper | 开合力曲线 | 力传感器标定 | ✅ |
+| EnergyBeam | 功率校准 | 功率计实测 vs 设定值 | ✅ |
+| 全局 | 电流传感器零偏 | 断电时读取 ADC 值 | ✅ |
+
+### 12.3 标定数据格式
+
+```yaml
+# /etc/telos/calibration.yaml
+# 每个执行器单独一段，用执行器 name 做 key
+
+left_motor:
+  type: rotary_velocity
+  pid:
+    kp: 0.52
+    ki: 0.08
+    kd: 0.03
+    integral_limit: 100
+  encoder_offset: 17       # 静止时编码器读数 (应归0)
+  deadband_rpm: 5          # 死区: 低于此转速电机不转
+  forward_reverse_symmetric: false  # 正反转不对称
+  calibration_date: "2026-06-23"
+  calibrated_by: "zhangshuaiqing"
+
+steering:
+  type: rotary_position
+  pwm_angle_map:           # 三点标定
+    0: [500, 0.0]          # [PWM值, 实际角度°]
+    1: [1500, 90.0]
+    2: [2500, 180.0]
+  home_offset: -2.3        # 零点偏移 (°)
+  gear_backlash: 1.5       # 齿轮回差 (°)
+  calibration_date: "2026-06-23"
+
+spray_pump:
+  type: pump
+  flow_curve:              # PWM占空比 → 流量映射
+    - [0.0, 0.0]           # [占空比%, 流量 L/min]
+    - [30.0, 0.15]
+    - [60.0, 0.45]
+    - [100.0, 0.92]
+  calibration_date: "2026-06-23"
+
+laser_weeder:
+  type: energy_beam
+  power_calibration:       # 设定值 → 实际输出
+    - [10, 9.2]            # [设定W, 实测W]
+    - [50, 48.7]
+    - [100, 101.3]
+    - [150, 147.5]
+  calibration_date: "2026-06-23"
+  calibrated_by: "optical_power_meter_sn123"
+```
+
+### 12.4 标定数据结构
+
+```python
+@dataclass
+class CalibrationData:
+    """标定数据的运行时表示"""
+    actuator_name: str
+    actuator_type: str
+    params: dict               # 原始标定数据
+    timestamp: float
+    checksum: str              # SHA256 防篡改
+    
+    @classmethod
+    def load(cls, path: str) -> dict[str, "CalibrationData"]:
+        """加载所有执行器的标定数据"""
+        import yaml
+        with open(path) as f:
+            raw = yaml.safe_load(f)
+        return {name: cls(name, cfg["type"], cfg, ...) 
+                for name, cfg in raw.items()}
+    
+    def apply(self, actuator: Actuator) -> None:
+        """将标定数据应用到执行器实例"""
+        if self.actuator_type == "rotary_velocity":
+            actuator.pid = PID(**self.params["pid"])
+            actuator.encoder_offset = self.params["encoder_offset"]
+        elif self.actuator_type == "pump":
+            actuator.flow_curve = self.params["flow_curve"]
+        # ... 其他类型
+
+class CalibrationManager:
+    """标定管理器 — 加载、验证、热更新"""
+    
+    def __init__(self, path: str = "/etc/telos/calibration.yaml"):
+        self._path = path
+        self._data: dict[str, CalibrationData] = {}
+    
+    def load(self) -> None:
+        self._data = CalibrationData.load(self._path)
+    
+    def apply_to(self, executor: Executor) -> list[str]:
+        """对所有已注册执行器应用标定，返回应用失败的列表"""
+        failed = []
+        for actuator in executor.actuators():
+            cal = self._data.get(actuator.name)
+            if cal:
+                try:
+                    cal.apply(actuator)
+                except Exception as e:
+                    failed.append(f"{actuator.name}: {e}")
+            else:
+                failed.append(f"{actuator.name}: 无标定数据，使用默认值")
+        return failed
+    
+    def validate_checksum(self) -> bool:
+        """验证标定文件完整性"""
+        import hashlib
+        with open(self._path, 'rb') as f:
+            actual = hashlib.sha256(f.read()).hexdigest()
+        return actual == self._manifest_checksum
+```
+
+### 12.5 标定流程集成
+
+标定流程集成在 Ch12 启动自检中：
+
+```
+Phase 3: 执行器自检
+  ├── 加载标定数据
+  │     ├── 文件存在? ──NO──▶ 使用默认值 + 标记 "未标定"
+  │     ├── SHA256 校验通过? ──NO──▶ 告警 "标定文件损坏"
+  │     └── 应用标定 → 所有执行器
+  │
+  ├── 执行自检 (用标定后的参数)
+  │
+  └── 标定状态报告:
+       "3 个执行器已标定, 1 个使用默认值 (steering 未标定)"
+```
