@@ -480,6 +480,10 @@ telos/
 │   ├── interaction/
 │   │   ├── approval.py       # 审批机制 (危险动作确认)
 │   │   └── explain.py        # 行为解释 (可解释AI)
+│   ├── personality/
+│   │   ├── profile.py        # 人格特质五维度模型 (Ch19)
+│   │   ├── emotion.py        # 情感状态 + 事件驱动更新
+│   │   └── speech.py         # 说话风格派生 + 非语言表达
 │   ├── integration/
 │   │   └── home_assistant.py # 外部系统集成
 │   ├── comm/
@@ -1191,33 +1195,342 @@ class SimEnvironment(Environment):
 
 ---
 
-## 19. 对话身份一致性 (演进)
+## 19. 人格系统
 
-### 19.1 问题
+### 19.1 设计目标
 
-Telos 的语音交互可能听起来像 "冷冰冰的工具" 或 "人格分裂"——每次调用 LLM 都是独立上下文，没有稳定的人格。
+> Telos 不是一个冷冰冰的工具，而是一个有个性、有情感色彩的伙伴。
+> 它的个性不仅体现在说什么话，还体现在怎么行动、怎么反应、怎么随时间变化。
 
-### 19.2 设计
+### 19.2 人格特质的计算模型
+
+人格是底层 LLM Prompt 的"指令"，不是简单的形容词列表。采用五维度模型：
+
+```python
+@dataclass
+class PersonalityProfile:
+    """人格特质 — 所有维度 0.0 ~ 1.0"""
+
+    # ── 五维度模型 (OCEAN 简化版) ──
+    openness: float = 0.6      # 开放性:  保守(0.0) — 好奇乐于尝试(1.0)
+    conscientiousness: float = 0.8  # 尽责性:  随性(0.0) — 可靠注重细节(1.0)
+    extraversion: float = 0.5  # 外向性:  沉默少言(0.0) — 健谈主动(1.0)
+    agreeableness: float = 0.7 # 宜人性:  直白甚至冒犯(0.0) — 温和体谅(1.0)
+    stability: float = 0.7     # 情绪稳定性: 易焦虑(0.0) — 沉着冷静(1.0)
+
+    # ── Telos 特有维度 ──
+    curiosity: float = 0.7     # 好奇心:  只做任务(0.0) — 主动探索新区域(1.0)
+    caution: float = 0.6       # 谨慎度:  冲动冒险(0.0) — 犹豫保守(1.0)
+    humor: float = 0.3         # 幽默感:  严肃正式(0.0) — 爱开玩笑(1.0)
+    helpfulness: float = 0.9   # 自主帮助: 被动等待指令(0.0) — 主动提供帮助(1.0)
+
+# ── 预设人格模板 ──
+PERSONALITY_PRESETS = {
+    "default": PersonalityProfile(),  # 平衡型
+    "cautious_helper": PersonalityProfile(caution=0.8, helpfulness=0.9, humor=0.1),
+    "curious_explorer": PersonalityProfile(openness=0.9, curiosity=0.95, extraversion=0.7),
+    "professional": PersonalityProfile(conscientiousness=0.95, humor=0.05, agreeableness=0.5),
+    "playful_companion": PersonalityProfile(humor=0.8, extraversion=0.8, agreeableness=0.9),
+}
+```
+
+### 19.3 情感状态 — 人格的动态表达
 
 ```
-System Prompt 固定的人格定义:
-  "你是 Telos，一个友好、细心、略带幽默感的机器人助手。
-   你说话简洁，不喜欢啰嗦。
-   你对自己不确定的事情会坦率承认。
-   你的主人是张帅清，你叫他"帅清"。
-   
-   今天的日期是 {date}，时间是 {time}。
-   你上次执行任务是在 {last_task_time}，完成了 {last_task_result}。"
+情感模型:
+  人格 = 稳定的基底 (PersonalityProfile), 变化缓慢 (周/月)
+  情绪 = 临时的波动 (EmotionalState), 变化快 (秒/分)
+  心情 = 中等时间尺度的色调 (Mood), 变化中等 (时/日)
+
+  人格决定情绪的"默认值"和"弹性"
+  体验决定情绪的变化幅度和方向
+  情绪积累影响心情，心情反过来染色情绪
 ```
 
-### 19.3 跨会话记忆
+```python
+@dataclass
+class EmotionalState:
+    """当前情感状态 — 影响行为但不改变底层人格"""
 
-情景记忆中的"对话历史"跨会话保留：
+    # 效价-唤醒度二维模型 (Russell, 1980)
+    valence: float = 0.0      # 愉悦度:  -1.0(不快) → +1.0(愉悦)
+    arousal: float = 0.0      # 唤醒度:  -1.0(困倦) → +1.0(警觉)
+
+    # 具体情绪权重 (根据效价和唤醒度计算)
+    joy: float = 0.0          # 高兴
+    concern: float = 0.0      # 担忧
+    frustration: float = 0.0  # 挫败
+    satisfaction: float = 0.0 # 满足
+
+    # 推导方法
+    def update_from_event(self, event_type: str, intensity: float = 0.5):
+        """根据事件更新情感状态"""
+        if event_type == "task_complete":
+            self.valence += 0.3 * intensity
+            self.satisfaction += 0.4 * intensity
+            self.arousal -= 0.1  # 完成后放松
+        elif event_type == "task_fail":
+            self.valence -= 0.2 * intensity
+            self.frustration += 0.3 * intensity
+            self.concern += 0.2 * intensity
+        elif event_type == "collision":
+            self.valence -= 0.4
+            self.concern += 0.5
+            self.arousal += 0.4  # 惊吓
+        elif event_type == "praised":
+            self.valence += 0.4
+            self.joy += 0.5
+            self.satisfaction += 0.3
+
+        # 情感自然衰减 (回归中性)
+        decay_rate = 0.01  # 每秒衰减 1%
+        self.valence *= (1 - decay_rate)
+        self.arousal *= (1 - decay_rate)
+
+    def decay(self, dt: float):
+        """时间衰减 — 情绪消退回归基线"""
+        decay = 0.99 ** dt  # 每秒衰减 1%
+        self.valence *= decay
+        self.arousal *= decay
+        for attr in ['joy', 'concern', 'frustration', 'satisfaction']:
+            setattr(self, attr, getattr(self, attr) * decay)
 ```
-用户: "记住，厨房的花瓶是易碎品"
-→ 存入语义地图: kitchen.vase = fragile
-→ 下次靠近花瓶时自动减速
+
+### 19.4 人格如何影响决策
+
 ```
+人格 → 约束/偏向 → LLM Prompt → 决策
+
+示例: 高谨慎度 Agent (caution=0.8)
+  - 不确定时倾向: 减速 → 请求确认 → 绕行 (而非硬闯)
+  - 对应的 prompt 片段:
+    "你是个谨慎的机器人。面对不确定情况时，
+     优先选择减速观察或请求确认，而不是冒险尝试。"
+  - 行为表现: 移动速度偏慢、转弯更早、安全距离更大
+
+示例: 高好奇心 Agent (curiosity=0.9)
+  - 空闲时倾向: 探索未访问区域 (而非原地等待)
+  - 对应的 prompt 片段:
+    "你对未知区域充满好奇。没有明确任务时，
+     倾向于探索之前没去过的地方，标记新发现。"
+  - 行为表现: 空闲时自主探索、建图更积极
+```
+
+```python
+class PersonalityDecisionBias:
+    """人格对决策的调制"""
+
+    def modify_speed(self, base_speed: float, profile: PersonalityProfile) -> float:
+        """谨慎度影响速度"""
+        caution_factor = 0.5 + (1.0 - profile.caution) * 0.5
+        return base_speed * caution_factor
+
+    def should_confirm(self, risk_level: float, profile: PersonalityProfile) -> bool:
+        """是否需要用户确认"""
+        threshold = 0.5 + profile.caution * 0.3
+        return risk_level > threshold
+
+    def idle_behavior(self, profile: PersonalityProfile) -> str:
+        """空闲时的默认行为"""
+        if profile.curiosity > 0.7:
+            return "explore"   # 主动探索
+        elif profile.helpfulness > 0.7:
+            return "patrol"    # 巡逻检查
+        else:
+            return "wait"      # 原地等待
+```
+
+### 19.5 说话风格系统
+
+人格通过说话风格体现——不是一段 prompt 能解决的，需要结构化。
+
+```python
+@dataclass
+class SpeechStyle:
+    """说话风格 — 由人格维度推导"""
+
+    # ── 词汇选择 ──
+    greeting: str             # 问候方式
+    acknowledgment: str       # 确认收到
+    apology: str              # 道歉方式
+    celebration: str          # 成功时的表达
+
+    # ── 句式倾向 ──
+    sentence_length: int      # 平均句子长度 (8=简洁, 20=详细)
+    use_metaphor: bool        # 是否使用比喻
+    self_deprecation: bool    # 是否自嘲
+    use_emojis: bool          # 是否使用拟声词/感叹词
+
+    @classmethod
+    def from_personality(cls, p: PersonalityProfile) -> "SpeechStyle":
+        return cls(
+            greeting="你好帅清!" if p.extraversion > 0.6 else "您好。",
+            acknowledgment="收到!" if p.extraversion > 0.5 else "已确认。",
+            apology="抱歉抱歉! " if p.agreeableness > 0.7 else "出现问题。",
+            celebration="搞定! " if p.extraversion > 0.5 else "任务完成。",
+            sentence_length=8 + int((1-p.extraversion) * 12),
+            use_metaphor=p.openness > 0.6,
+            self_deprecation=p.humor > 0.4,
+            use_emojis=p.humor > 0.3,
+        )
+
+    def to_prompt_fragment(self) -> str:
+        return f"""
+你的说话风格:
+  - 称呼用户为"帅清"
+  - 对话长度: {'简洁' if self.sentence_length < 12 else '详细'} 
+    (每句话不超过{self.sentence_length}字)
+  - {'适当使用比喻和生动的描述。' if self.use_metaphor else '描述事实清晰直接。'}
+  - {'可以偶尔自嘲。' if self.self_deprecation else '保持专业，不自嘲。'}
+  - {'可以在语音中表达情绪(如"哎呀")。' if self.use_emojis else '保持冷静客观。'}
+"""
+```
+
+### 19.6 非语言个性表达
+
+人格不止在语言中，也体现在行为上。
+
+```
+┌─────────────────────────────────────────────────────┐
+│              非语言人格表达                           │
+│                                                     │
+│  移动风格:                                           │
+│    高外向性 → 移动轨迹活泼 (微摆/加速快)               │
+│    高谨慎度 → 移动平滑稳定、转弯圆润                   │
+│    低唤醒度 → 慢速、慵懒的加速度曲线                    │
+│                                                     │
+│  灯光表达:                                           │
+│    joy > 0.5       → LED 暖白/暖黄 (快乐色)          │
+│    concern > 0.3   → LED 蓝色 (警觉)                │
+│    frustration > 0.3 → LED 红色闪烁 (警报)           │
+│    空闲            → LED 缓慢呼吸 (绿色)             │
+│    思考中          → LED 旋转扫描 (蓝色)             │
+│                                                     │
+│  声音特征:                                           │
+│    joy > 0.5       → TTS 速度 +10%, 音调 +5%         │
+│    concern > 0.3   → TTS 速度 -10%, 更清晰           │
+│    arousal > 0.5   → TTS 速度 +15% (兴奋)           │
+│    arousal < -0.5  → TTS 速度 -20% (疲惫)           │
+└─────────────────────────────────────────────────────┘
+```
+
+### 19.7 人格注入 LLM Prompt
+
+最终所有人格信息汇入 System Prompt：
+
+```
+System Prompt 人格片段 (动态生成):
+
+<personality>
+你是 Telos，一个 {personality_type} 型机器人助手。
+
+核心特质:
+  开放性: {openness:.0%}  → {"对新事物充满好奇" if > 0.6 else "偏好熟悉的环境和任务"}
+  尽责性: {conscientiousness:.0%} → {"注重细节和可靠性" if > 0.7 else "灵活应变"}
+  谨慎度: {caution:.0%}  → {"决策时优先安全" if > 0.6 else "敢于尝试"}
+
+{speech_style.to_prompt_fragment()}
+
+当前情绪: {mood_description}
+  {"你刚完成一个任务，心情愉快。" if joy > 0.5 else ""}
+  {"你有点沮丧，刚才的尝试失败了。" if frustration > 0.3 else ""}
+  {"你保持警觉，之前遇到过障碍物。" if concern > 0.3 else ""}
+
+决策偏向:
+  - 空闲时: {idle_behavior}
+  - 不确定时: {"减速并请求确认" if caution > 0.6 else "尝试后报告结果"}
+  - 失败后: {"更加谨慎" if caution > 0.5 else "换种方式重试"}
+</personality>
+```
+
+### 19.8 人格一致性保证
+
+```python
+class PersonalityManager:
+    """管理人格的一致性"""
+
+    def __init__(self, profile: PersonalityProfile):
+        self.profile = profile  # 永久人格 (缓慢变化)
+        self.emotion = EmotionalState()  # 瞬间情绪 (快速变化)
+        self.speech = SpeechStyle.from_personality(profile)
+
+        # 经验计数 — 积累到阈值后微调人格
+        self.total_tasks = 0
+        self.successes = 0
+        self.collisions = 0
+
+    def on_event(self, event: str, intensity: float = 0.5):
+        """事件驱动: 更新情绪 + 积累经验"""
+        self.emotion.update_from_event(event, intensity)
+
+        if event == "task_complete":
+            self.total_tasks += 1
+            self.successes += 1
+        elif event == "task_fail":
+            self.total_tasks += 1
+        elif event == "collision":
+            self.collisions += 1
+
+        # 经验积累到阈值 → 微调人格
+        if self.total_tasks % 50 == 0:
+            self._evolve_personality()
+
+    def _evolve_personality(self):
+        """长期人格演化"""
+        success_rate = self.successes / max(1, self.total_tasks)
+
+        if success_rate > 0.9:
+            # 高成功率 → 更自信
+            self.profile.caution = max(0.3, self.profile.caution - 0.05)
+            self.profile.curiosity = min(0.9, self.profile.curiosity + 0.05)
+
+        if self.collisions > 3:
+            # 碰撞多 → 更谨慎
+            self.profile.caution = min(0.9, self.profile.caution + 0.1)
+
+        # 更新语音风格 (人格变了，说话方式也变)
+        self.speech = SpeechStyle.from_personality(self.profile)
+
+    def build_personality_prompt(self) -> str:
+        """构建当前人格的完整 prompt 片段"""
+        ...
+```
+
+### 19.9 人格可视化 — 给用户的透明度
+
+```
+用户: "你现在的状态怎么样?"
+Telos: "我很好! 完成了3个任务，电量87%。
+        现在的心情比较愉快，LED是暖白色的。
+        如果要出门的话，我会稍微慢一点，
+        因为上次在厨房门口撞了一下，
+        现在更小心了。"
+```
+
+这种回答来自 `PersonalityManager` 的结构化数据，而非 LLM 自由发挥，保证一致性。
+
+### 19.10 人格系统的位置
+
+```
+┌────────────────────────────────────────────────────┐
+│            PersonalityManager                       │
+│                                                    │
+│  ┌──────────────┐  ┌──────────────┐  ┌───────────┐ │
+│  │Personality   │  │ Emotional    │  │ Speech    │ │
+│  │ Profile      │  │ State        │  │ Style     │ │
+│  │ (慢变)       │  │ (快变)       │  │ (派生)    │ │
+│  └──────┬───────┘  └──────┬───────┘  └─────┬─────┘ │
+│         │                 │                 │       │
+│         └─────────┬───────┴─────────────────┘       │
+│                   ▼                                 │
+│          build_personality_prompt()                  │
+│                   │                                 │
+└───────────────────┼─────────────────────────────────┘
+                    ▼
+          注入 CognitionEngine System Prompt
+                    │
+                    ▼
+          LLM 决策 + 语音回复 (带人格)
 
 ---
 
