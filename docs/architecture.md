@@ -484,19 +484,25 @@ telos/
 │   │   └── home_assistant.py # 外部系统集成
 │   ├── comm/
 │   │   └── stm32.py          # STM32 二进制通信协议
+│   ├── concurrency/
+│   │   └── scheduler.py      # 多线程调度器 (Ch21)
+│   ├── security/
+│   │   └── security.py       # 信息安全 (Ch22)
 │   ├── observability/
 │   │   ├── logger.py         # 分层日志系统
 │   │   └── metrics.py        # 关键指标采集
 │   └── utils/
-│       └── config.py         # 配置管理
+│       └── config.py         # 配置管理 (Ch23)
 ├── sim/
 │   └── environment.py        # 仿真环境统一接口
 ├── docs/
-│   ├── architecture.md       # 本文档 (总体架构 — 20 章)
+│   ├── architecture.md       # 本文档 (总体架构 — 23 章)
 │   ├── actuators.md          # 7 原语详细规格 (+ 扩展机制)
 │   ├── perception.md         # 感知通道详细规格
 │   ├── cognition.md          # Prompt 工程 + RL 循环
 │   ├── tasks.md              # 任务系统设计
+│   ├── concurrency.md        # 并发模型与线程安全
+│   ├── security.md           # 信息安全设计
 │   ├── safety.md             # 安全与错误处理设计
 │   ├── protocol.md           # 通信协议规范
 │   ├── extending.md          # 扩展指南
@@ -1065,6 +1071,54 @@ System Prompt 注入:
   → 如果使用激光，必须降低速度 (电机各 25W)
 ```
 
+### 16.6 关机与断电恢复
+
+机器人可能在任何时候断电——被撞翻、电池耗尽、人为关机。必须保证重启后不是"从头再来"。
+
+**常规关机流程：**
+```
+用户指令: "关机" 或 电击按钮长按3s
+  │
+  ▼
+1. 保存状态到磁盘
+   - 当前位置 (里程计累积值)
+   - 未完成任务 DAG (序列化)
+   - 情景记忆中最后一条记录的 step 编号
+   - 拓扑地图 + 语义地图
+2. 执行器回零点 (可选)
+3. 向 STM32 发送 SHUTDOWN 指令
+4. 关闭进程
+5. STM32 切断主电 (保留 RTC)
+```
+
+**断电恢复流程：**
+```
+上电 → Ch12 启动自检 → 加载持久化状态
+
+情况 A: 正常关机后重启
+  加载任务 DAG → 继续上次未完成的子任务
+  加载拓扑地图 → 定位 ← 扫描周围特征匹配
+  加载里程计 → 推断当前位置
+
+情况 B: 异常断电 (电池耗尽/碰撞)
+  运行完整性检查:
+    任务文件是否损坏? → 损坏则丢弃，语音告知
+    里程计数据是否可信? → IMU 从零开始，重新定位
+    执行器是否在安全位置? → 自检时做回零
+  如果无法恢复上下文:
+    语音: "系统遭遇异常断电，任务已重置。
+           需要重新下达指令。"
+  如果能部分恢复:
+    语音: "断电前的任务是'给B区喷药'，
+           已完成导航和扫描，是否继续喷洒?"
+```
+
+**持久化要点：**
+- **写入时机**: 每个子任务完成时写一次（而不是每秒写）
+- **原子性**: 先写临时文件 → 校验 → rename 覆盖正式文件（防止写一半断电）
+- **存储位置**: `/var/lib/telos/state/` (Linux FHS 标准)
+- **RTC 时钟**: STM32 保持 RTC，重启后时间准确
+
 ---
 
 ## 17. 多智能体协调 (演进)
@@ -1193,4 +1247,364 @@ class HomeAssistantIntegration(Integration):
     name = "home_assistant"
     def get_sensor(self, entity_id: str) -> dict: ...
     def call_service(self, domain: str, service: str, data: dict) -> bool: ...
+```
+
+---
+
+## 21. 并发模型
+
+### 21.1 问题
+
+系统有 6 个不同频率的循环同时运行：
+
+| 循环 | 频率 | 运行位置 | 阻塞? |
+|------|------|---------|------|
+| STM32 控制 | 1kHz | STM32 固件 | 独立 |
+| 端侧安全 | 100Hz | 端侧 CPU | 必须实时 |
+| 端侧感知 | 30Hz | 端侧 CPU | 阻塞(I/O) |
+| 语音 VAD | 持续 | 端侧 CPU | 阻塞(音频流) |
+| LLM 推理 | ~2Hz | 端侧 CPU (调用API) | 阻塞(网络) |
+| 事件日志 | 按需 | 端侧 CPU | 阻塞(I/O) |
+
+这些不能简单串行——LLM 阻塞 500ms 时不能卡死安全监控。
+
+### 21.2 并发模型选择
+
+```
+方案对比:
+
+A) 单进程单线程 (事件循环)     B) 多线程              C) 多进程
+─────────────────────────    ────────────────       ────────────────
+实现简单                      GIL 限制 Python        隔离性最好
+阻塞操作卡死所有循环             I/O 密集场景可行        进程间通信开销大
+Python asyncio                 共享内存方便            资源占用多
+不适合我们的场景                  线程安全需小心
+
+选择: B) 多线程 — 适合 I/O密集型 (LLM=网络I/O, 感知=设备I/O)
+      安全循环用独立线程 + 高优先级
+```
+
+### 21.3 线程分配
+
+```
+主线程 (Main Thread)
+  ├── 编排线程: Agent 主循环
+  │     负责: 状态机调度、记忆更新、LLM结果处理
+  │     线程安全: 只读 Observation，只写 Decision
+  │
+  ├── 感知线程: PerceptionManager
+  │     负责: 30Hz 采集所有传感器通道
+  │     输出: 线程安全的 Observation 快照 (atomic swap)
+  │
+  ├── 安全线程: SafetyMonitor (高优先级)
+  │     负责: 100Hz 规则校验
+  │     权限: 可直接调用 executor.emergency_stop_all()
+  │     线程安全: 只读当前 action，只写紧急信号
+  │
+  ├── 语音线程: VoiceChannel
+  │     负责: 持续监听 + VAD + ASR
+  │     输出: 识别的文本 → 事件队列
+  │
+  └── STM32 通信线程: CommBridge
+        负责: UART 收发，心跳监控
+        输出: 传感器数据 → Observation快照
+        输入: 动作指令 → STM32
+```
+
+### 21.4 线程间通信
+
+```python
+import threading
+import queue
+
+# Observation: 原子快照 (感知线程写入, 主线程读取)
+class AtomicObservation:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._obs = Observation()
+
+    def update(self, obs: Observation):
+        with self._lock:
+            self._obs = obs
+
+    def snapshot(self) -> Observation:
+        with self._lock:
+            return self._obs  # 简单场景直接返回引用
+
+# 紧急信号: 零延迟 (安全线程 → 主线程)
+emergency_flag = threading.Event()
+# 安全线程: emergency_flag.set()
+# 主线程:   emergency_flag.is_set() → 立即停止
+
+# LLM 决策: 队列 (感知线程 → 主线程)
+decision_queue = queue.Queue(maxsize=5)
+# 感知线程: 满足发送条件 → 放入队列 → 主线程消费
+
+# 语音指令: 优先级队列
+voice_queue = queue.PriorityQueue()
+# 高优先级: "急停" = priority 0  → 立即处理
+# 普通:     "去B区" = priority 10
+```
+
+### 21.5 线程优先级与安全保证
+
+```
+优先级: 安全线程 > STM32通信 > 感知 > 编排 > LLM
+
+Python 层面:
+  threading.Thread 无法设置真正的 OS 优先级
+  解决: 安全线程不做任何可能阻塞的操作
+       - 不分配内存 (预分配所有缓冲区)
+       - 不做 I/O (只读共享内存)
+       - 不做 Python 对象创建 (复用预分配对象)
+       - 超时检测: 如果安全线程被挂起 > 10ms → STM32 看门狗触发
+
+最终保障: 即使端侧 CPU 所有线程全部卡死，
+          STM32 的硬件看门狗 (<1ms) 仍然独立运行，
+          会触发急停。
+```
+
+### 21.6 启动与关闭顺序
+
+```
+启动顺序 (必须严格):
+  1. STM32 通信线程 (建立硬件连接)
+  2. 安全线程 (开始监控)
+  3. 感知线程 (开始采集)
+  4. 语音线程 (开始监听)
+  5. 编排线程 (Agent 就绪)
+
+关闭顺序 (与启动相反):
+  1. 编排线程 → 停止新任务
+  2. 语音线程 → 停止监听
+  3. 感知线程 → 停止采集
+  4. 安全线程 → 最后一次状态检查
+  5. STM32 通信 → 发送 SHUTDOWN → 关闭连接
+```
+
+---
+
+## 22. 信息安全
+
+### 22.1 威胁模型
+
+机器人连 WiFi、有 API Key、支持远程访问。攻击面：
+
+| 威胁 | 攻击途径 | 后果 |
+|------|---------|------|
+| API Key 泄露 | 日志文件、配置文件明文 | LLM 被滥用/账单爆炸 |
+| 远程未授权控制 | 网络端口暴露、弱认证 | 物理攻击（机器人被操控撞人） |
+| 固件篡改 | STM32 无签名验证 | 底层绕过所有安全限制 |
+| 摄像头被劫持 | 调试端口开放 | 隐私泄露 |
+| 中间人攻击 | HTTP 明文传输 | 决策被篡改 |
+| 本地提权 | sudo 配置不当 | 完全控制 |
+
+### 22.2 API Key 安全
+
+```
+┌─────────────────────────────────────────────────┐
+│            API Key 存储层级                       │
+│                                                 │
+│  Level 0: 环境变量 (.env 文件) ← 当前             │
+│    风险: .env 被误提交到 git                      │
+│    措施: .gitignore + 预提交检查                  │
+│                                                 │
+│  Level 1: 加密配置文件                            │
+│    实现: fernet 对称加密 → /etc/telos/secrets.enc │
+│    启动时需要输入 master password (一次性)         │
+│                                                 │
+│  Level 2: 硬件安全模块 (未来 Jetson)               │
+│    Jetson 有 TPM/安全启动 → Key 存在安全区域       │
+│                                                 │
+│  Level 3: API 网关模式 (推荐)                     │
+│    不自持 Key → 通过本地代理服务中转                │
+│    代理服务做: 速率限制、审计、Key轮换              │
+└─────────────────────────────────────────────────┘
+```
+
+### 22.3 网络访问控制
+
+```
+当前 (最简):
+  WiFi → 路由器 → Internet
+
+最小安全:
+  WiFi → 路由器 + 防火墙规则:
+    - 出站: 只允许 HTTPS (443)
+    - 入站: 拒绝所有 (除非 Tailscale VPN)
+    - DNS: 只允许指定 DNS 服务器
+
+推荐:
+  WiFi → Tailscale VPN → Internet
+  - 所有远程访问通过 Tailscale (已部署)
+  - 不暴露任何公开端口
+  - 端侧 API 也走 Tailscale IP
+```
+
+### 22.4 固件与代码安全
+
+```
+代码安全:
+  - git 仓库: SSH Key 认证 (已配)
+  - 依赖审计: pip-audit / safety 扫描已知漏洞
+  - OTA 更新: 下载后 SHA256 校验 (Ch20 GitHub集成)
+
+STM32 固件安全:
+  - 读保护: 启用 RDP Level 1 (禁止读取固件)
+  - 看门狗: 独立硬件看门狗 (已设计)
+  - 安全启动: JTAG/SWD 禁用 (量产时)
+```
+
+### 22.5 运行时安全
+
+```python
+class SecurityContext:
+    """运行时安全上下文"""
+
+    # 用户认证 (本地语音也需验证 — 防止陌生人语音控制)
+    voice_auth_enabled: bool = False  # 初期关闭，后续可开声纹识别
+
+    # 操作审计
+    audit_log: list  # 记录所有外部指令 (谁、什么时间、做了什么)
+
+    # 速率限制
+    max_llm_calls_per_minute: int = 120  # 防止账单失控
+
+    # 安全模式切换需要确认
+    def set_mode(self, new_mode: str) -> bool:
+        if new_mode == "AUTO" and self.current_mode == "MANUAL":
+            # 手动→自动需要语音确认
+            return self._confirm("切换到自动模式?")
+```
+
+---
+
+## 23. 配置管理
+
+### 23.1 问题
+
+系统有 50+ 配置参数散落在各模块。需要统一的配置体系，满足：
+- 有合理默认值，开箱能用
+- 用户可以覆盖
+- 运行时可以调整（不重启）
+- 支持持久化（修改后重启保持）
+- 不同环境可以切换（开发/测试/生产）
+
+### 23.2 配置层次
+
+```
+配置优先级 (高→低):
+  ┌──────────────────────────────────┐
+  │ 1. 命令行参数 (--speed-limit 2.0) │ ← 单次覆盖
+  ├──────────────────────────────────┤
+  │ 2. 环境变量 (TELOS_SPEED=2.0)    │ ← 进程级覆盖
+  ├──────────────────────────────────┤
+  │ 3. 用户配置文件 (~/.telos.yaml)   │ ← 用户覆盖默认值
+  ├──────────────────────────────────┤
+  │ 4. 系统配置文件 (/etc/telos.yaml) │ ← 部署时设置
+  ├──────────────────────────────────┤
+  │ 5. 代码默认值                    │ ← 安全保守的默认值
+  └──────────────────────────────────┘
+```
+
+### 23.3 配置域
+
+```yaml
+# /etc/telos.yaml — 完整配置示例
+
+telos:
+  # ── Agent ──
+  agent:
+    task: "待机，等待用户指令"
+    max_steps: 10000
+    mode: "supervised"  # auto | supervised | approval | manual
+
+  # ── LLM ──
+  llm:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    api_base: "https://api.deepseek.com/v1"
+    timeout_sec: 30
+    max_retries: 3
+    max_calls_per_minute: 120
+
+  # ── 安全 ──
+  safety:
+    speed_limit_ms: 1.0       # 最大前进速度
+    energy_limit_w: 100.0     # 最大能量输出
+    obstacle_stop_cm: 30      # TOF 急停距离
+    tilt_limit_deg: 45        # 倾覆阈值
+    approval_required:        # 需要审批的动作
+      - "EnergyBeam.fire"
+      - "Pump.set_flow>0.5"
+
+  # ── 感知 ──
+  perception:
+    vision:
+      enabled: true
+      camera_id: 0
+      resolution: [640, 480]
+      quality: 70
+    voice:
+      enabled: true
+      vad_aggressiveness: 2
+      tts_voice: "zh-CN-XiaoxiaoNeural"
+      wake_word: null  # 不使用唤醒词
+    llm_interval_ms: 500  # LLM 观测间隔
+
+  # ── 电源 ──
+  power:
+    low_battery_warn: 30     # 低电量警告阈值 %
+    low_battery_return: 20   # 自动返航阈值 %
+    low_battery_emergency: 10 # 紧急模式阈值 %
+    solar_charging: false    # 是否启用太阳能
+    max_solar_power_w: 50    # 太阳能板功率
+
+  # ── 执行器标定 ──
+  actuators:
+    left_motor:
+      max_rpm: 3000
+      pid: {kp: 0.5, ki: 0.1, kd: 0.05}
+      calibration_offset: 0.0
+    right_motor:
+      max_rpm: 3000
+      pid: {kp: 0.5, ki: 0.1, kd: 0.05}
+      calibration_offset: 0.0
+
+  # ── 存储 ──
+  storage:
+    state_dir: "/var/lib/telos/state"
+    log_dir: "/var/log/telos"
+    memory_db: "/var/lib/telos/memory.db"
+    max_log_size_mb: 100
+```
+
+### 23.4 运行时配置热更新
+
+```python
+class ConfigManager:
+    def __init__(self):
+        self._config = self._load_all()
+        self._watchers: dict[str, callable] = {}
+
+    def get(self, key: str, default=None):
+        """key 格式: "safety.speed_limit_ms" """
+        ...
+
+    def on_change(self, key: str, callback):
+        """注册配置变更回调"""
+        self._watchers[key] = callback
+
+    def reload(self):
+        """运行时重新加载配置文件"""
+        old = self._config
+        self._config = self._load_all()
+        # 通知所有变更
+        for key, cb in self._watchers.items():
+            if self.get(key) != self._get_nested(old, key):
+                cb(self.get(key))
+
+# 使用示例
+config.on_change("safety.speed_limit_ms",
+    lambda v: safety.update_speed_limit(v))
 ```
