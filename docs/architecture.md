@@ -500,7 +500,7 @@ telos/
 ├── sim/
 │   └── environment.py        # 仿真环境统一接口
 ├── docs/
-│   ├── architecture.md       # 本文档 (总体架构 — 23 章)
+│   ├── architecture.md       # 本文档 (总体架构 — 25 章)
 │   ├── actuators.md          # 7 原语详细规格 (+ 扩展机制)
 │   ├── perception.md         # 感知通道详细规格
 │   ├── cognition.md          # Prompt 工程 + RL 循环
@@ -1921,3 +1921,436 @@ class ConfigManager:
 config.on_change("safety.speed_limit_ms",
     lambda v: safety.update_speed_limit(v))
 ```
+
+---
+
+## 24. 测试策略
+
+### 24.1 设计原则
+
+> **2000 行的架构文档，如果不能验证，就是一篇科幻小说。**
+> 测试策略不是开发完成后的"可选项"，而是设计本身的验证回路。
+
+### 24.2 测试金字塔
+
+```
+                ╱────────────╲
+               ╱   HIL 测试   ╲         2-5%: 硬件在环
+              ╱───────────────╲             真实STM32 + 模拟传感器
+             ╱  集成测试       ╲       10-15%: 多模块协作
+            ╱─────────────────╲            Perception → Cognition → Actuator
+           ╱   单元测试         ╲    80-85%: 每个模块独立
+          ╱─────────────────────╲        纯Python, 无硬件, 秒级执行
+```
+
+### 24.3 各层测试范围
+
+**L1: 单元测试 (80% 的测试量)**
+
+```
+测试目标: 每个模块的纯逻辑
+
+telos/tests/
+├── unit/
+│   ├── test_observation.py      # Observation.to_prompt_text() 各种组合
+│   ├── test_actuators.py        # 7种原语的状态转换、参数校验
+│   ├── test_executor.py         # 注册/执行/急停 逻辑
+│   ├── test_memory.py           # CRUD、容量限制、衰减
+│   ├── test_safety.py           # 速度/能量上限校验
+│   ├── test_personality.py      # 事件驱动情感更新、演化逻辑
+│   ├── test_config.py           # 优先级覆盖、热更新
+│   ├── test_task_manager.py     # DAG构建、子任务状态转换
+│   └── test_emotion.py          # 情感状态数学: 更新→衰减→归零
+
+示例: test_emotion.py
+
+def test_joy_decays_to_zero_over_time():
+    e = EmotionalState()
+    e.update_from_event("task_complete", intensity=0.8)
+    assert e.joy > 0.3  # 刚完成时高兴
+
+    # 模拟 300 秒衰减
+    for _ in range(300):
+        e.decay(1.0)
+    assert e.joy < 0.05  # 5分钟后消退
+
+def test_collision_makes_agent_concerned():
+    e = EmotionalState()
+    e.update_from_event("collision", intensity=0.8)
+    assert e.concern > 0.4
+    assert e.valence < -0.2
+```
+
+**L2: 集成测试 (15%)**
+
+```
+测试目标: 多个模块协作的正确性
+
+├── integration/
+│   ├── test_perception_to_observation.py  # 感知→Observation完整链路
+│   ├── test_cognition_pipeline.py         # Observation→LLM Prompt→Decision解析
+│   ├── test_agent_loop.py                 # 完整闭环: 感知→认知→安全→执行→记忆
+│   ├── test_personality_injection.py      # PersonalityManager→Prompt→LLM调用
+│   └── test_failover.py                   # LLM超时→降级→重试 完整链路
+
+示例: test_agent_loop.py
+
+def test_full_loop_with_mock_llm():
+    agent = TelosAgent(config)
+    agent.register_perception(MockVisionChannel())
+    agent.register_actuator(MockMotor("left"))
+    agent.cognition = MockCognitionEngine(
+        responses=['{"action_type":"move","actions":[...]}]']
+    )
+
+    result = agent.step()
+    assert result["step"] == 1
+    assert agent.memory.episodic.count() == 1
+    assert agent.step_count == 1
+```
+
+**L3: 硬件在环 (5%)**
+
+```
+测试目标: 真实STM32 + 模拟/真实传感器
+
+├── hil/
+│   ├── test_stm32_comms.py       # 真实帧收发, CRC校验, 超时
+│   ├── test_stm32_emergency.py   # 物理急停按钮触发→端侧确认
+│   ├── test_camera_capture.py    # 真实摄像头→VisionChannel采集
+│   └── test_full_stack.py        # 端到端: 摄像头→LLM→STM32→电机微动
+```
+
+### 24.4 不可测试组件的 Mock 策略
+
+| 真实组件 | Mock 替换 | 使用场景 |
+|---------|----------|---------|
+| DeepSeek/Kimi API | `MockCognitionEngine` — 返回预设 JSON | 99% 的测试 |
+| STM32 UART | `MockSTM32Bridge` — 预设传感器数据 | 集成测试 |
+| 摄像头 | `MockVisionChannel` — 从文件加载测试图片 | 感知管道测试 |
+| TTS 引擎 | `MockVoiceOutput` — 记录文本，不播放 | 语音管道测试 |
+| 真实传感器 | 静态测试数据文件 (JSON) | 传感器融合测试 |
+
+```python
+class MockCognitionEngine:
+    """模拟 LLM — 返回预设的决策序列"""
+    def __init__(self, responses: list[str]):
+        self.responses = responses
+        self.call_count = 0
+        self.last_prompt = None
+
+    def think(self, obs, task, capabilities, memory) -> CognitionDecision:
+        raw = self.responses[self.call_count % len(self.responses)]
+        self.call_count += 1
+        return self._parse_response(raw)
+
+    def _parse_response(self, text): ...
+```
+
+### 24.5 人格一致性测试
+
+```python
+def test_personality_consistency_across_calls():
+    """同一个 Agent 调用 LLM 10 次，Prompt 中的人格片段应该一致"""
+    personality = PersonalityProfile(caution=0.8, humor=0.2)
+    manager = PersonalityManager(personality)
+
+    prompts = []
+    for _ in range(10):
+        prompt = manager.build_personality_prompt()
+        prompts.append(prompt)
+
+    # 核心特质不变
+    assert all("谨慎" in p for p in prompts)
+    # 情感部分可能变化
+    assert len(set(prompts)) <= 5  # 最多5种不同的prompt(情感组合数)
+
+def test_emotion_recovers_after_cooldown():
+    """碰撞后 10 分钟，情绪应该恢复"""
+    manager = PersonalityManager(PersonalityProfile())
+    manager.on_event("collision", intensity=0.9)
+    assert manager.emotion.valence < -0.2  # 碰撞后不愉快
+
+    # 模拟 600 秒
+    for _ in range(600):
+        manager.emotion.decay(1.0)
+    assert abs(manager.emotion.valence) < 0.01  # 回归中性
+
+def test_personality_evolution_after_100_tasks():
+    """100 次高成功率后，谨慎度应该下降"""
+    manager = PersonalityManager(PersonalityProfile(caution=0.7))
+    for _ in range(100):
+        manager.on_event("task_complete")
+    assert manager.profile.caution < 0.7  # 更自信
+```
+
+### 24.6 仿真对照测试
+
+```
+Ch18 定义的仿真环境可以用于对照测试:
+
+  test_scenario = "从A区导航到B区，绕过中间障碍"
+  
+  仿真结果: 路径长度 15m, 时间 45s, 碰撞 0
+  真实机器人: 路径长度 15±1m, 时间 45±3s, 碰撞 0
+  → 对比差距 → 评估 sim2real gap
+```
+
+### 24.7 回归测试与 CI
+
+```yaml
+# .github/workflows/test.yml
+on: [push, pull_request]
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pip install pytest
+      - run: pytest tests/unit/ -v --tb=short
+  
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest tests/integration/ -v --tb=short
+  
+  personality:
+    runs-on: ubuntu-latest  # 人格测试独立运行, 时间衰减测试需要精确计时
+    steps:
+      - run: pytest tests/unit/test_emotion.py tests/unit/test_personality.py -v
+
+  hil:
+    runs-on: [self-hosted, stm32]  # 只在有 STM32 的设备上运行
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - run: pytest tests/hil/ -v
+```
+
+### 24.8 测试覆盖率目标
+
+| 层 | 覆盖率目标 | 理由 |
+|------|------|------|
+| 单元测试 | > 90% | 纯逻辑，无借口 |
+| 集成测试 | 关键路径 100% | agent.step() 全路径必须通过 |
+| 人格系统 | > 95% | 情感数学必须精确 |
+| HIL | 安全关键路径 100% | 急停、看门狗 |
+
+---
+
+## 25. 依赖注入与系统启动
+
+### 25.1 问题
+
+系统有 18+ 个模块，彼此依赖：
+
+```
+TelosAgent
+  ├── PerceptionManager → VisionChannel, VoiceChannel, ProprioChannel
+  ├── WorkingMemory, EpisodicMemory
+  ├── CognitionEngine → httpx, API key
+  ├── Executor → RotaryVelocity, RotaryPosition, ...
+  ├── TaskManager → Task DAG
+  ├── SafetyMonitor → Config
+  ├── PersonalityManager → PersonalityProfile, EmotionalState, SpeechStyle
+  ├── PowerManager → Config
+  ├── TopologyMap → SQLite
+  └── CommBridge → STM32 UART
+```
+
+手动创建 18 个对象并注入依赖关系 → 易出错、难测试、不可复用。
+
+### 25.2 方案 — 服务容器 (Service Container)
+
+```python
+class ServiceContainer:
+    """Telos 模块的创建与装配中心
+    
+    不是重量级DI框架，而是显式的、可读的工厂方法集合。
+    """
+    
+    def __init__(self, config: ConfigManager):
+        self.config = config
+        self._instances: dict[str, Any] = {}
+    
+    # ── 单例服务 ──
+    
+    def memory(self) -> tuple[WorkingMemory, EpisodicMemory]:
+        if "memory" not in self._instances:
+            self._instances["memory"] = (
+                WorkingMemory(max_items=10),
+                EpisodicMemory(db_path=self.config.get("storage.memory_db"))
+            )
+        return self._instances["memory"]
+    
+    def perception(self) -> PerceptionManager:
+        if "perception" not in self._instances:
+            pm = PerceptionManager()
+            if self.config.get("perception.vision.enabled"):
+                pm.register(VisionChannel(
+                    camera_id=self.config.get("perception.vision.camera_id"),
+                    quality=self.config.get("perception.vision.quality")
+                ))
+            if self.config.get("perception.voice.enabled"):
+                pm.register(VoiceChannel())
+            pm.register(ProprioChannel())
+            self._instances["perception"] = pm
+        return self._instances["perception"]
+    
+    def cognition(self) -> CognitionEngine:
+        if "cognition" not in self._instances:
+            self._instances["cognition"] = CognitionEngine(
+                provider=self.config.get("llm.provider"),
+                model=self.config.get("llm.model"),
+            )
+        return self._instances["cognition"]
+    
+    def executor(self) -> Executor:
+        if "executor" not in self._instances:
+            ex = Executor()
+            # 从配置加载执行器列表
+            for name, cfg in self.config.get("actuators", {}).items():
+                if cfg.get("type") == "rotary_velocity":
+                    ex.register(RotaryVelocity(name, max_speed=cfg["max_rpm"]))
+                elif cfg.get("type") == "rotary_position":
+                    ex.register(RotaryPosition(name))
+                # ... 其他类型
+            self._instances["executor"] = ex
+        return self._instances["executor"]
+    
+    def personality(self) -> PersonalityManager:
+        if "personality" not in self._instances:
+            preset = self.config.get("personality.preset", "default")
+            profile = PERSONALITY_PRESETS.get(preset, PersonalityProfile())
+            self._instances["personality"] = PersonalityManager(profile)
+        return self._instances["personality"]
+    
+    def power(self) -> PowerManager:
+        if "power" not in self._instances:
+            self._instances["power"] = PowerManager(
+                low_battery_warn=self.config.get("power.low_battery_warn"),
+                low_battery_return=self.config.get("power.low_battery_return"),
+                solar_enabled=self.config.get("power.solar_charging"),
+            )
+        return self._instances["power"]
+    
+    def comm(self) -> CommBridge:
+        if "comm" not in self._instances:
+            self._instances["comm"] = CommBridge(
+                port=self.config.get("stm32.port", "/dev/ttyUSB0"),
+                baudrate=self.config.get("stm32.baudrate", 115200),
+            )
+        return self._instances["comm"]
+    
+    def safety(self) -> SafetyMonitor:
+        if "safety" not in self._instances:
+            self._instances["safety"] = SafetyMonitor(
+                speed_limit=self.config.get("safety.speed_limit_ms"),
+                energy_limit=self.config.get("safety.energy_limit_w"),
+                tilt_limit=self.config.get("safety.tilt_limit_deg"),
+            )
+        return self._instances["safety"]
+    
+    def task_manager(self) -> TaskManager:
+        if "task_manager" not in self._instances:
+            self._instances["task_manager"] = TaskManager()
+        return self._instances["task_manager"]
+    
+    # ── 组装完整 Agent ──
+    
+    def build_agent(self) -> TelosAgent:
+        """创建并装配完整的 TelosAgent"""
+        agent = TelosAgent()
+        
+        # 注入所有依赖
+        agent.perception = self.perception()
+        wm, em = self.memory()
+        agent.working_memory = wm
+        agent.episodic_memory = em
+        agent.cognition = self.cognition()
+        agent.executor = self.executor()
+        agent.safety = self.safety()
+        agent.personality = self.personality()
+        agent.power = self.power()
+        agent.task_manager = self.task_manager()
+        
+        # 交叉依赖: 安全模块需要 executor 引用 (急停)
+        agent.safety.set_executor(agent.executor)
+        
+        # 交叉依赖: 人格 → 认知 (Prompt 注入)
+        agent.cognition.set_personality_provider(
+            lambda: agent.personality.build_personality_prompt()
+        )
+        
+        return agent
+
+# ── 使用 ──
+# main.py:
+config = ConfigManager()      # 加载 /etc/telos.yaml
+container = ServiceContainer(config)
+agent = container.build_agent()
+agent.run()
+```
+
+### 25.3 测试环境下的依赖替换
+
+```python
+class TestServiceContainer(ServiceContainer):
+    """测试容器 — 自动替换硬件相关模块为 Mock"""
+    
+    def comm(self) -> CommBridge:
+        return MockSTM32Bridge()  # 不连接真实 STM32
+    
+    def cognition(self) -> CognitionEngine:
+        return MockCognitionEngine(responses=[...])  # 预设 LLM 回复
+    
+    # 其他模块使用真实实现 (测试纯逻辑)
+
+# tests/integration/test_agent_loop.py:
+def test_full_loop():
+    container = TestServiceContainer(test_config)
+    agent = container.build_agent()
+    # agent 拥有完整的真实模块 + Mock 硬件/LLM
+    result = agent.step()
+    assert result["step"] == 1
+```
+
+### 25.4 模块启动顺序
+
+```
+┌─────────────────────────────────────────────────┐
+│              Telos 启动序列                       │
+│                                                 │
+│  1. ConfigManager: 加载所有配置文件               │
+│      优先级合成: default → /etc/telos.yaml → env │
+│                                                 │
+│  2. ServiceContainer: 创建服务实例                │
+│      按依赖顺序:                                  │
+│        Memory → Perception → Executor →          │
+│        Safety → Cognition → Personality →        │
+│        Power → Task → Comm                       │
+│                                                 │
+│  3. build_agent(): 注入依赖                      │
+│      所有模块引用 → TelosAgent                   │
+│                                                 │
+│  4. 启动自检 (Ch12)                              │
+│      STM32 握手 → 传感器自检 → 执行器自检         │
+│      → 能力清单 → 降级判断                        │
+│                                                 │
+│  5. 启动线程 (Ch21)                              │
+│      STM32通信 → 安全 → 感知 → 语音 → 编排       │
+│                                                 │
+│  6. 就绪声明: "Telos 就绪"                       │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
+## 26. 架构文档演进记录
+
+| 版本 | 章节数 | 关键新增 |
+|------|------|---------|
+| v0.1 | 10 | 核心架构 (感知·记忆·认知·执行·循环·安全·协议·硬件·结构·待议) |
+| v1.0 | 20 | +任务系统·错误处理·初始化·可观测性·人机·空间·电源·多智能体·仿真·集成 |
+| v2.0 | 23 | +并发模型·信息安全·配置管理；Ch16.6断电恢复 |
+| v3.0 | 23 | Ch19 重写: 人格系统 (五维度·情感·说话风格·非语言表达·决策偏向·长期演化) |
+| v3.1 | 25 | +测试策略·依赖注入与系统启动 |
